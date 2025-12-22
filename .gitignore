@@ -35,6 +35,4 @@ dist-ssr
 *.sln
 *.sw?
 
-
-/logs
-/storage
+storage
