@@ -13,9 +13,10 @@ interface DocumentListProps {
     onDeleteDocument: (filename: string) => void;
     isOpen: boolean;
     onClose: () => void;
+    onPreview: (url: string) => void;
 }
 
-export const DocumentList = ({ sessionId, documents, onDeleteDocument, isOpen, onClose }: DocumentListProps) => {
+export const DocumentList = ({ sessionId, documents, onDeleteDocument, isOpen, onClose, onPreview }: DocumentListProps) => {
     const API_BASE_URL = "http://localhost:8000"; // Should come from config
 
     return (
@@ -61,15 +62,13 @@ export const DocumentList = ({ sessionId, documents, onDeleteDocument, isOpen, o
                                             <FileText size={16} className="text-blue-400" />
                                         </div>
                                         <div className="flex-1 min-w-0">
-                                            <a
-                                                href={`${API_BASE_URL}/chats/${sessionId}/documents/${doc.filename}`}
-                                                target="_blank"
-                                                rel="noopener noreferrer"
-                                                className="font-medium text-sm text-slate-200 truncate hover:text-blue-400 hover:underline cursor-pointer block"
+                                            <button
+                                                onClick={() => onPreview(`${API_BASE_URL}/chats/${sessionId}/documents/${doc.filename}`)}
+                                                className="font-medium text-sm text-slate-200 truncate hover:text-blue-400 hover:underline cursor-pointer block text-left"
                                                 title={`Preview ${doc.filename}`}
                                             >
                                                 {doc.filename}
-                                            </a>
+                                            </button>
                                             <p className="text-xs text-slate-500 mt-1">
                                                 {(doc.size / 1024).toFixed(1)} KB
                                             </p>

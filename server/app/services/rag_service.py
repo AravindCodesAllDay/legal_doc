@@ -84,7 +84,7 @@ class RAGService:
         # Delete from Chroma
         results = vectorstore.get(where={"source": filename})
         if results and results["ids"]:
-             vectorstore.delete(ids=results["ids"])
+            vectorstore.delete(ids=results["ids"])
         
         # Delete file from storage
         _, doc_path, _ = self._get_session_paths(session_id)

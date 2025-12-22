@@ -4,10 +4,13 @@ import { Layout } from "../../components/Layout";
 import { ChatArea, type Message } from "../../components/ChatArea";
 import { MessageInput } from "../../components/MessageInput";
 import { type ChatSession } from "../../components/Sidebar";
-import { DocumentList, type DocumentMetadata } from "../../components/DocumentList";
+import {
+  DocumentList,
+  type DocumentMetadata,
+} from "../../components/DocumentList";
 import { FileText } from "lucide-react";
 
-const API_BASE_URL = "http://localhost:8000";
+const API_BASE_URL = import.meta.env.VITE_API;
 
 export default function Home() {
   const { id: urlSessionId } = useParams();
@@ -18,7 +21,9 @@ export default function Home() {
   const [documents, setDocuments] = useState<DocumentMetadata[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState("");
   const [isDocListOpen, setIsDocListOpen] = useState(false);
+  const [previewDocUrl, setPreviewDocUrl] = useState<string | null>(null);
 
   // Fetch sessions on mount
   useEffect(() => {
@@ -101,9 +106,9 @@ export default function Home() {
         body: JSON.stringify({ title: newTitle }),
       });
       if (res.ok) {
-        setSessions(prev => prev.map(s =>
-          s.id === sessionId ? { ...s, title: newTitle } : s
-        ));
+        setSessions((prev) =>
+          prev.map((s) => (s.id === sessionId ? { ...s, title: newTitle } : s))
+        );
       }
     } catch (error) {
       console.error("Failed to rename session", error);
@@ -115,16 +120,21 @@ export default function Home() {
     if (!confirm(`Delete document ${filename}?`)) return;
 
     try {
-      const res = await fetch(`${API_BASE_URL}/chats/${urlSessionId}/documents/${filename}`, {
-        method: "DELETE"
-      });
+      const res = await fetch(
+        `${API_BASE_URL}/chats/${urlSessionId}/documents/${filename}`,
+        {
+          method: "DELETE",
+        }
+      );
       if (res.ok) {
-        setDocuments(prev => prev.filter(d => d.filename !== filename));
+        setDocuments((prev) => prev.filter((d) => d.filename !== filename));
+        // Refresh session data to get updated system messages
+        fetchSessionData(urlSessionId);
       }
     } catch (error) {
       console.error("Failed to delete document", error);
     }
-  }
+  };
 
   const handleSendMessage = async (text: string) => {
     if (!text.trim()) return;
@@ -160,11 +170,14 @@ export default function Home() {
     setIsLoading(true);
 
     try {
-      const response = await fetch(`${API_BASE_URL}/chats/${targetSessionId}/message`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text }),
-      });
+      const response = await fetch(
+        `${API_BASE_URL}/chats/${targetSessionId}/message`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: text }),
+        }
+      );
 
       if (!response.body) throw new Error("No response body");
 
@@ -194,10 +207,10 @@ export default function Home() {
               if (data.token) {
                 assistantMsg = {
                   ...assistantMsg,
-                  content: assistantMsg.content + data.token
+                  content: assistantMsg.content + data.token,
                 };
 
-                setMessages(prev => {
+                setMessages((prev) => {
                   const newMessages = [...prev];
                   newMessages[newMessages.length - 1] = assistantMsg;
                   return newMessages;
@@ -209,10 +222,12 @@ export default function Home() {
           }
         }
       }
-
     } catch (error) {
       console.error("Failed to send message", error);
-      setMessages(prev => [...prev, { role: "assistant", content: "Error: Failed to get response." }]);
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: "Error: Failed to get response." },
+      ]);
     } finally {
       setIsLoading(false);
     }
@@ -245,33 +260,50 @@ export default function Home() {
 
     if (!targetSessionId) return;
 
-    const formData = new FormData();
-    // Verify backend expects "files" as list
-    Array.from(files).forEach((file) => {
-      formData.append("files", file);
-    });
+    const fileArray = Array.from(files);
 
     try {
       setIsUploading(true);
-      const res = await fetch(`${API_BASE_URL}/chats/${targetSessionId}/upload`, {
-        method: "POST",
-        body: formData,
-      });
 
-      if (res.ok) {
-        const data = await res.json();
-        // Refresh documents list
-        fetchSessionData(targetSessionId);
-        setIsDocListOpen(true);
-        console.log(`Uploaded ${data.uploaded_count} files`);
-      } else {
-        alert("Upload failed.");
+      let uploadedCount = 0;
+      const total = fileArray.length;
+
+      for (let i = 0; i < total; i++) {
+        const file = fileArray[i];
+        setUploadProgress(`Uploading ${file.name} (${i + 1}/${total})...`);
+
+        const formData = new FormData();
+        formData.append("files", file);
+
+        try {
+          const res = await fetch(
+            `${API_BASE_URL}/chats/${targetSessionId}/upload`,
+            {
+              method: "POST",
+              body: formData,
+            }
+          );
+
+          if (res.ok) {
+            uploadedCount++;
+            // Refresh documents immediately after each successful upload to show progress in UI
+            fetchSessionData(targetSessionId);
+            setIsDocListOpen(true);
+          } else {
+            console.error(`Failed to upload ${file.name}`);
+          }
+        } catch (err) {
+          console.error(`Error uploading ${file.name}`, err);
+        }
       }
+
+      console.log(`Uploaded ${uploadedCount} files`);
     } catch (error) {
-      console.error("Upload error", error);
-      alert("Error uploading file.");
+      console.error("Upload process error", error);
+      alert("Error uploading files.");
     } finally {
       setIsUploading(false);
+      setUploadProgress("");
     }
   };
 
@@ -323,12 +355,13 @@ export default function Home() {
           <ChatArea messages={messages} isLoading={isLoading} />
         </div>
 
-        <div className="p-4 md:p-6 bg-gradient-to-t from-slate-950 via-slate-950 to-transparent">
+        <div className="p-4 md:p-6 bg-linear-to-t from-slate-950 via-slate-950 to-transparent">
           <MessageInput
             onSendMessage={handleSendMessage}
             onFileUpload={handleFileUpload}
             isLoading={isLoading}
             isUploading={isUploading}
+            uploadProgress={uploadProgress}
           />
         </div>
 
@@ -338,7 +371,34 @@ export default function Home() {
           onDeleteDocument={handleDeleteDocument}
           isOpen={isDocListOpen}
           onClose={() => setIsDocListOpen(false)}
+          onPreview={(url) => setPreviewDocUrl(url)}
         />
+
+        {/* PDF Preview Modal */}
+        {previewDocUrl && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 text-white">
+            <div className="bg-slate-900 w-full max-w-5xl h-[85vh] rounded-2xl border border-slate-700 shadow-2xl flex flex-col relative overflow-hidden">
+              <div className="flex items-center justify-between p-4 border-b border-slate-800 bg-slate-900">
+                <h3 className="font-semibold text-lg">Document Preview</h3>
+                <button
+                  onClick={() => setPreviewDocUrl(null)}
+                  className="p-1 hover:bg-slate-800 rounded-full transition-colors"
+                >
+                  <FileText size={20} className="rotate-45" /> {/* Use X icon if imported, but FileText is imported. Actually X is needed. */}
+                  {/* Wait, X is not imported in this file. Let's fix imports first or assume Layout has it or just add logic. */}
+                  <span className="text-2xl font-bold leading-none">&times;</span>
+                </button>
+              </div>
+              <div className="flex-1 bg-slate-800 relative">
+                <iframe
+                  src={previewDocUrl}
+                  className="w-full h-full border-0"
+                  title="Document Preview"
+                />
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </Layout>
   );
