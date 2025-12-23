@@ -61,7 +61,7 @@ export const DocumentList = ({ sessionId, documents, onDeleteDocument, isOpen, o
                                         <div className="mt-1 p-2 bg-blue-500/10 rounded-lg">
                                             <FileText size={16} className="text-blue-400" />
                                         </div>
-                                        <div className="flex-1 min-w-0">
+                                        <div className="flex-1 overflow-hidden">
                                             <button
                                                 onClick={() => onPreview(`${API_BASE_URL}/chats/${sessionId}/documents/${doc.filename}`)}
                                                 className="font-medium text-sm text-slate-200 truncate hover:text-blue-400 hover:underline cursor-pointer block text-left"
