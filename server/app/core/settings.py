@@ -38,13 +38,7 @@ class Settings(BaseSettings):
     OLLAMA_HOST: str = os.getenv("OLLAMA_HOST", "http://localhost:11434")
     OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "llama3.1")
     OLLAMA_TEMPERATURE: float = float(os.getenv("OLLAMA_TEMPERATURE", "0.8"))
-    OLLAMA_TOP_K: int = int(os.getenv("OLLAMA_TOP_K", "40"))
-    OLLAMA_TOP_P: float = float(os.getenv("OLLAMA_TOP_P", "0.9"))
-    OLLAMA_NUM_CTX: int = int(os.getenv("OLLAMA_NUM_CTX", "2048"))
-    OLLAMA_SEED: int = int(os.getenv("OLLAMA_SEED", "0"))
-    OLLAMA_REPEAT_PENALITY: float = float(
-        os.getenv("OLLAMA_REPEAT_PENALITY", "1.1"))
-
+    
     class Config:
         env_file = ".env"
 

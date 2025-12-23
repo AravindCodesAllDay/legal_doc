@@ -29,6 +29,8 @@ class RenameChatRequest(BaseModel):
 
 class MessageRequest(BaseModel):
     message: str
+    use_mmr: Optional[bool] = True  # Enable MMR by default
+    top_k: Optional[int] = 5  # Number of context chunks
 
 
 @router.post("/", response_model=ChatSession)
@@ -36,6 +38,7 @@ async def create_chat_session(
     request: CreateChatRequest,
     db: AsyncIOMotorDatabase = Depends(get_db)
 ):
+    """Create a new chat session"""
     session = ChatSession(title=request.title or "New Chat")
     await db["sessions"].insert_one(session.dict())
     return session
@@ -47,6 +50,7 @@ async def list_chat_sessions(
     limit: int = 20,
     db: AsyncIOMotorDatabase = Depends(get_db)
 ):
+    """List all chat sessions"""
     cursor = db["sessions"].find().sort(
         "updated_at", -1).skip(skip).limit(limit)
     sessions = await cursor.to_list(length=limit)
@@ -58,6 +62,7 @@ async def get_chat_session(
     session_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db)
 ):
+    """Get a specific chat session"""
     session = await db["sessions"].find_one({"id": session_id})
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -69,13 +74,18 @@ async def delete_chat_session(
     session_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db)
 ):
+    """Delete a chat session and all associated data"""
     result = await db["sessions"].delete_one({"id": session_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    # Clean up RAG data
-    await rag_service.delete_session_data(session_id)
-    return {"message": "Session deleted"}
+    # Clean up RAG data (documents and vectorstores)
+    deletion_success = await rag_service.delete_session_data(session_id)
+
+    return {
+        "message": "Session deleted",
+        "rag_cleanup_success": deletion_success
+    }
 
 
 @router.post("/{session_id}/upload")
@@ -84,67 +94,131 @@ async def upload_documents(
     files: Optional[List[UploadFile]] = File(default=None),
     db: AsyncIOMotorDatabase = Depends(get_db)
 ):
+    """Upload documents to a chat session"""
     if not files:
         raise HTTPException(
-            status_code=400, detail="No files uploaded or 'files' field missing")
+            status_code=400,
+            detail="No files uploaded or 'files' field missing"
+        )
 
+    # Get or create session
     session = await db["sessions"].find_one({"id": session_id})
     if not session:
-        # Create new session if strictly allowed or just handle it as new
-        # User requested: "can be added after its created first" -> fix: auto-create
-        session = ChatSession(id=session_id, title="New Chat")
-        await db["sessions"].insert_one(session.dict())
+        new_session = ChatSession(id=session_id, title="New Chat")
+        await db["sessions"].insert_one(new_session.dict())
+        session = new_session.dict()  # Convert to dict for consistent access
+
+    # Get existing filenames to check for duplicates
+    existing_filenames = {doc.get("filename")
+                          for doc in session.get("documents", [])}
 
     uploaded_files = []
     total_chunks = 0
+    failed_files = []
+    skipped_files = []
 
     for file in files:
+        # Check for duplicates BEFORE processing
+        if file.filename in existing_filenames:
+            print(f"Skipping duplicate file: {file.filename}")
+            skipped_files.append({
+                "filename": file.filename,
+                "error": "File already exists in this session"
+            })
+            continue
+
         temp_path = f"temp_{uuid.uuid4()}_{file.filename}"
+
         try:
+            # Save uploaded file temporarily
             with open(temp_path, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
 
             try:
-                chunk_count = await rag_service.ingest_file(temp_path, file.filename, session_id)
-                total_chunks += chunk_count or 0
+                # Ingest file with enhanced stats
+                stats = await rag_service.ingest_file(
+                    temp_path,
+                    file.filename,
+                    session_id
+                )
+                # stats is now a dict, not an int
+                chunk_count = stats.get(
+                    "chunk_count", 0) if isinstance(stats, dict) else 0
+                total_chunks += chunk_count
 
-                # Save Metadata
+                # Save metadata with stats
                 doc_meta = DocumentMetadata(
                     filename=file.filename,
-                    content_type=file.content_type,
-                    size=file.size
+                    content_type=file.content_type or "application/octet-stream",
+                    size=file.size or 0
                 )
-                uploaded_files.append(doc_meta.dict())
+
+                # Add stats to metadata dict
+                doc_dict = doc_meta.dict()
+                doc_dict["stats"] = stats
+                uploaded_files.append(doc_dict)
+
+                # Add to existing filenames set
+                existing_filenames.add(file.filename)
 
             except FileExistsError:
-                print(f"Skipping duplicate file: {file.filename}")
-                continue  # Skip duplicates
+                # This shouldn't happen now since we check above, but keep as safety
+                print(f"File exists error for: {file.filename}")
+                skipped_files.append({
+                    "filename": file.filename,
+                    "error": "File already exists in this session"
+                })
+                continue
+
+            except Exception as e:
+                print(f"Error ingesting {file.filename}: {e}")
+                failed_files.append({
+                    "filename": file.filename,
+                    "error": str(e)
+                })
+                continue
 
         except Exception as e:
-            # Continue or fail? Let's log and continue
             print(f"Error uploading {file.filename}: {e}")
+            failed_files.append({
+                "filename": file.filename,
+                "error": f"Upload failed: {str(e)}"
+            })
         finally:
+            # Clean up temp file
             if os.path.exists(temp_path):
                 os.remove(temp_path)
 
-    # Bulk push
+    # Bulk update session with uploaded files
     if uploaded_files:
         await db["sessions"].update_one(
             {"id": session_id},
-            {"$push": {"documents": {"$each": uploaded_files}},
-                "$set": {"updated_at": datetime.utcnow()}}
+            {
+                "$push": {"documents": {"$each": uploaded_files}},
+                "$set": {"updated_at": datetime.utcnow()}
+            }
         )
 
-        # Add System Message for Event
+        # Add system message for successful uploads
         filenames = ", ".join([d["filename"] for d in uploaded_files])
         system_note = ChatMessage(
-            role="system", content=f"User uploaded files: {filenames}")
+            role="system",
+            content=f"User uploaded files: {filenames}"
+        )
         await db["sessions"].update_one(
             {"id": session_id},
             {"$push": {"messages": system_note.dict()}}
         )
 
-    return {"uploaded_count": len(uploaded_files), "total_chunks_ingested": total_chunks}
+    return {
+        "uploaded_count": len(uploaded_files),
+        "skipped_count": len(skipped_files),
+        "failed_count": len(failed_files),
+        "total_chunks_ingested": total_chunks,
+        "uploaded_files": [f["filename"] for f in uploaded_files],
+        "skipped_files": skipped_files,
+        "failed_files": failed_files
+    }
 
 
 @router.post("/{session_id}/message")
@@ -153,57 +227,88 @@ async def send_message(
     request: MessageRequest,
     db: AsyncIOMotorDatabase = Depends(get_db)
 ):
+    """Send a message and get AI response with RAG context"""
     session_data = await db["sessions"].find_one({"id": session_id})
     if not session_data:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    # 1. Retrieve Context
-    # 1. Retrieve Context
-    related_docs = await rag_service.query(request.message, session_id)
-    
-    # Format context with source citations
-    context_texts = []
-    
-    # Add list of available documents to system context
-    available_docs = [d.get("filename") for d in session_data.get("documents", [])]
-    if available_docs:
-        doc_list_str = ", ".join(available_docs)
-        context_texts.append(f"SYSTEM NOTE: The user has the following documents uploaded in this session: {doc_list_str}. Only answer based on these documents if the user asks about them.")
-    
-    for doc in related_docs:
-        source = doc.metadata.get("source", "Unknown")
-        # Ensure we only use context if it matches one of the active documents? 
-        # Actually RAG service already filters by chroma collection (session_id), so cross-session contamination is handled by collection isolation.
-        # But cross-document contamination within same session:
-        context_texts.append(f"[Source: {source}]\n{doc.page_content}")
+    # Get list of available documents
+    available_docs = [d.get("filename")
+                      for d in session_data.get("documents", [])]
 
-    # 2. Append User Message
+    # Retrieve relevant context using enhanced query
+    context_texts = []
+
+    if available_docs:
+        try:
+            # Query with MMR for better diversity
+            related_docs = await rag_service.query(
+                request.message,
+                session_id,
+                filenames=available_docs,
+                k=request.top_k,
+                use_mmr=request.use_mmr
+            )
+
+            # Add document list to system context
+            doc_list_str = ", ".join(available_docs)
+            context_texts.append(
+                f"AVAILABLE DOCUMENTS: {doc_list_str}\n"
+                f"Answer based on these documents when relevant."
+            )
+
+            # Format retrieved chunks with source citations
+            if related_docs:
+                context_texts.append("\nRELEVANT CONTEXT:")
+                for idx, doc in enumerate(related_docs, 1):
+                    source = doc.metadata.get("source", "Unknown")
+                    chunk_idx = doc.metadata.get("chunk_index", "?")
+                    context_texts.append(
+                        f"\n[{idx}. Source: {source}, Chunk {chunk_idx}]\n{doc.page_content}"
+                    )
+        except Exception as e:
+            print(f"Error retrieving context: {e}")
+            # Continue without context if retrieval fails
+
+    # Append user message to session
     user_msg = ChatMessage(role="user", content=request.message)
     await db["sessions"].update_one(
         {"id": session_id},
-        {"$push": {"messages": user_msg.dict()}, "$set": {
-            "updated_at": datetime.utcnow()}}
+        {
+            "$push": {"messages": user_msg.dict()},
+            "$set": {"updated_at": datetime.utcnow()}
+        }
     )
 
-    # 3. Construct Message History for LLM
-    history = session_data.get("messages", [])[-10:]  # Last 10 messages
+    # Construct message history for LLM (last 10 messages)
+    history = session_data.get("messages", [])[-10:]
     history.append(user_msg.dict())
 
-    # 4. Generator for Streaming
+    # Stream response
     async def event_generator():
         full_response = ""
-        async for token in ollama_service.stream_chat(history, context_texts):
-            full_response += token
-            yield f"data: {json.dumps({'token': token})}\n\n"
+        try:
+            async for token in ollama_service.stream_chat(history, context_texts):
+                full_response += token
+                yield f"data: {json.dumps({'token': token})}\n\n"
 
-        # Save Assistant Message
-        assistant_msg = ChatMessage(role="assistant", content=full_response)
-        await db["sessions"].update_one(
-            {"id": session_id},
-            {"$push": {"messages": assistant_msg.dict()}, "$set": {
-                "updated_at": datetime.utcnow()}}
-        )
-        yield "data: [DONE]\n\n"
+            # Save assistant message
+            assistant_msg = ChatMessage(
+                role="assistant", content=full_response)
+            await db["sessions"].update_one(
+                {"id": session_id},
+                {
+                    "$push": {"messages": assistant_msg.dict()},
+                    "$set": {"updated_at": datetime.utcnow()}
+                }
+            )
+            yield "data: [DONE]\n\n"
+
+        except Exception as e:
+            error_msg = f"Error generating response: {str(e)}"
+            print(error_msg)
+            yield f"data: {json.dumps({'error': error_msg})}\n\n"
+            yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -214,29 +319,43 @@ async def delete_document(
     filename: str,
     db: AsyncIOMotorDatabase = Depends(get_db)
 ):
+    """Delete a specific document from a session"""
     session = await db["sessions"].find_one({"id": session_id})
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    # 1. Remove from RAG
-    await rag_service.delete_document(session_id, filename)
+    # Delete from RAG (vectorstore + file)
+    deletion_success = await rag_service.delete_document(session_id, filename)
 
-    # 2. Remove from DB Metadata
+    if not deletion_success:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to delete document {filename}"
+        )
+
+    # Remove from database metadata
     await db["sessions"].update_one(
         {"id": session_id},
-        {"$pull": {"documents": {"filename": filename}},
-            "$set": {"updated_at": datetime.utcnow()}}
+        {
+            "$pull": {"documents": {"filename": filename}},
+            "$set": {"updated_at": datetime.utcnow()}
+        }
     )
 
-    # System Message
+    # Add system message
     system_note = ChatMessage(
-        role="system", content=f"User removed file: {filename}")
+        role="system",
+        content=f"User removed file: {filename}"
+    )
     await db["sessions"].update_one(
         {"id": session_id},
         {"$push": {"messages": system_note.dict()}}
     )
 
-    return {"message": f"Document {filename} deleted"}
+    return {
+        "message": f"Document {filename} deleted successfully",
+        "deletion_success": deletion_success
+    }
 
 
 @router.patch("/{session_id}")
@@ -245,6 +364,7 @@ async def rename_chat_session(
     request: RenameChatRequest,
     db: AsyncIOMotorDatabase = Depends(get_db)
 ):
+    """Rename a chat session"""
     result = await db["sessions"].update_one(
         {"id": session_id},
         {"$set": {"title": request.title, "updated_at": datetime.utcnow()}}
@@ -261,25 +381,91 @@ async def get_document_file(
     filename: str,
     db: AsyncIOMotorDatabase = Depends(get_db)
 ):
+    """Download/view a document file"""
     # Verify session exists
     session = await db["sessions"].find_one({"id": session_id})
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
+    # Verify document exists in session
+    doc_exists = any(
+        d.get("filename") == filename
+        for d in session.get("documents", [])
+    )
+    if not doc_exists:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found in this session"
+        )
+
     storage_path = os.path.join("storage", session_id, "documents", filename)
 
+    if not os.path.exists(storage_path):
+        raise HTTPException(status_code=404, detail="File not found on disk")
+
     try:
-        if not os.path.exists(storage_path):
-            raise HTTPException(status_code=404, detail="File not found")
-        
         # Ensure absolute path for safety
         abs_path = os.path.abspath(storage_path)
+
+        # Determine media type based on file extension
+        media_type = "application/pdf"
+        if filename.lower().endswith(".txt"):
+            media_type = "text/plain"
+        elif filename.lower().endswith(".json"):
+            media_type = "application/json"
+        elif filename.lower().endswith(".csv"):
+            media_type = "text/csv"
+
         return FileResponse(
-            abs_path, 
-            filename=filename, 
-            media_type="application/pdf", 
+            abs_path,
+            filename=filename,
+            media_type=media_type,
             content_disposition_type="inline"
         )
     except Exception as e:
         print(f"Error serving file {filename}: {e}")
-        raise HTTPException(status_code=500, detail=f"Could not serve file: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not serve file: {str(e)}"
+        )
+
+
+@router.get("/{session_id}/documents/{filename}/stats")
+async def get_document_stats(
+    session_id: str,
+    filename: str,
+    db: AsyncIOMotorDatabase = Depends(get_db)
+):
+    """Get statistics about a document's chunks and embeddings"""
+    session = await db["sessions"].find_one({"id": session_id})
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    stats = await rag_service.get_document_stats(session_id, filename)
+
+    if not stats:
+        raise HTTPException(
+            status_code=404,
+            detail="Could not retrieve document statistics"
+        )
+
+    return stats
+
+
+@router.get("/{session_id}/documents")
+async def list_session_documents(
+    session_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_db)
+):
+    """List all documents in a session with their metadata"""
+    session = await db["sessions"].find_one({"id": session_id})
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    documents = session.get("documents", [])
+
+    return {
+        "session_id": session_id,
+        "document_count": len(documents),
+        "documents": documents
+    }

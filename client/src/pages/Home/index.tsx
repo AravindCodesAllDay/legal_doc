@@ -10,10 +10,12 @@ import {
 } from "../../components/DocumentList";
 import { FileText } from "lucide-react";
 
+import { v4 as uuidv4 } from "uuid";
+
 const API_BASE_URL = import.meta.env.VITE_API;
 
 export default function Home() {
-  const { id: urlSessionId } = useParams();
+  const { id: urlSessionId } = useParams<{ id: string }>();
   const navigate = useNavigate();
 
   const [sessions, setSessions] = useState<ChatSession[]>([]);
@@ -153,8 +155,11 @@ export default function Home() {
           const newSession = await res.json();
           setSessions((prev) => [newSession, ...prev]);
           targetSessionId = newSession.id;
-          // Navigate but continue execution without waiting for route change effect
+          // Navigate to the new session
           navigate(`/chat/${targetSessionId}`, { replace: true });
+
+          // Wait a bit for navigation to complete before sending message
+          await new Promise((resolve) => setTimeout(resolve, 100));
         } else {
           return;
         }
@@ -164,7 +169,7 @@ export default function Home() {
       }
     }
 
-    // Optimistic Update
+    // Optimistic Update - Add user message
     const userMsg: Message = { role: "user", content: text };
     setMessages((prev) => [...prev, userMsg]);
     setIsLoading(true);
@@ -185,6 +190,7 @@ export default function Home() {
       const decoder = new TextDecoder();
       let assistantMsg: Message = { role: "assistant", content: "" };
 
+      // Add assistant message placeholder
       setMessages((prev) => [...prev, assistantMsg]);
 
       while (true) {
@@ -217,7 +223,7 @@ export default function Home() {
                 });
               }
             } catch (e) {
-              // Ignore
+              // Ignore parse errors
             }
           }
         }
@@ -234,73 +240,100 @@ export default function Home() {
   };
 
   const handleFileUpload = async (files: FileList) => {
+    // 1. Determine the ID: Use existing URL ID or generate a new one locally
     let targetSessionId = urlSessionId;
+    const isNewSession = !targetSessionId;
 
-    if (!targetSessionId) {
-      // Create session first
-      try {
-        const res = await fetch(`${API_BASE_URL}/chats`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ title: "New Chat (Files)" }),
-        });
-        if (res.ok) {
-          const newSession = await res.json();
-          setSessions((prev) => [newSession, ...prev]);
-          targetSessionId = newSession.id;
-          navigate(`/chat/${targetSessionId}`, { replace: true });
-        } else {
-          return;
-        }
-      } catch (e) {
-        console.error("Error creating session", e);
-        return;
-      }
+    if (isNewSession) {
+      targetSessionId = uuidv4(); // Generate ID client-side
     }
-
-    if (!targetSessionId) return;
 
     const fileArray = Array.from(files);
 
     try {
       setIsUploading(true);
+      setUploadProgress(`Uploading ${fileArray.length} file(s)...`);
 
-      let uploadedCount = 0;
-      const total = fileArray.length;
-
-      for (let i = 0; i < total; i++) {
-        const file = fileArray[i];
-        setUploadProgress(`Uploading ${file.name} (${i + 1}/${total})...`);
-
-        const formData = new FormData();
+      // Create FormData with ALL files at once
+      const formData = new FormData();
+      fileArray.forEach((file) => {
         formData.append("files", file);
+      });
 
-        try {
-          const res = await fetch(
-            `${API_BASE_URL}/chats/${targetSessionId}/upload`,
-            {
-              method: "POST",
-              body: formData,
-            }
-          );
-
-          if (res.ok) {
-            uploadedCount++;
-            // Refresh documents immediately after each successful upload to show progress in UI
-            fetchSessionData(targetSessionId);
-            setIsDocListOpen(true);
-          } else {
-            console.error(`Failed to upload ${file.name}`);
-          }
-        } catch (err) {
-          console.error(`Error uploading ${file.name}`, err);
+      // Single upload request with all files
+      const res = await fetch(
+        `${API_BASE_URL}/chats/${targetSessionId}/upload`,
+        {
+          method: "POST",
+          body: formData,
         }
-      }
+      );
 
-      console.log(`Uploaded ${uploadedCount} files`);
+      if (res.ok) {
+        const result = await res.json();
+
+        // Log the result for debugging
+        console.log("Upload result:", result);
+
+        // Show summary with better messaging
+        if (result.skipped_count > 0 || result.failed_count > 0) {
+          let message = "";
+          if (result.uploaded_count > 0) {
+            message += `${result.uploaded_count} file(s) uploaded successfully. `;
+          }
+          if (result.skipped_count > 0) {
+            const skippedFiles = result.skipped_files
+              .map((f: any) => f.filename)
+              .join(", ");
+            message += `Skipped (already exist): ${skippedFiles}. `;
+          }
+          if (result.failed_count > 0) {
+            const failedFiles = result.failed_files
+              .map((f: any) => f.filename)
+              .join(", ");
+            message += `Failed: ${failedFiles}`;
+          }
+          alert(message.trim());
+        }
+
+        // Update State & Navigate (even if some were skipped)
+        const totalProcessed = result.uploaded_count + result.skipped_count;
+        if (totalProcessed > 0) {
+          if (isNewSession) {
+            // Fetch the newly created session data
+            const sessionRes = await fetch(
+              `${API_BASE_URL}/chats/${targetSessionId}`
+            );
+            if (sessionRes.ok) {
+              const sessionData = await sessionRes.json();
+              // Add to sidebar
+              setSessions((prev) => [sessionData, ...prev]);
+              // Navigate to the new session
+              navigate(`/chat/${targetSessionId}`, { replace: true });
+
+              // Wait for navigation, then set state
+              await new Promise((resolve) => setTimeout(resolve, 100));
+              setMessages(sessionData.messages || []);
+              setDocuments(sessionData.documents || []);
+              setIsDocListOpen(true); // Auto-open doc list
+            }
+          } else {
+            // Refresh the current session data
+            await fetchSessionData(targetSessionId);
+            await fetchSessions(); // Update sidebar timestamp
+            setIsDocListOpen(true); // Auto-open doc list
+          }
+        } else {
+          alert("No files were uploaded successfully.");
+        }
+      } else {
+        const errorText = await res.text();
+        console.error("Upload failed:", errorText);
+        alert("Failed to upload files. Please try again.");
+      }
     } catch (error) {
       console.error("Upload process error", error);
-      alert("Error uploading files.");
+      alert("Error uploading files. Please check your connection.");
     } finally {
       setIsUploading(false);
       setUploadProgress("");
@@ -320,8 +353,6 @@ export default function Home() {
         {/* Toggle Docs Button - Only visible in chat */}
         {urlSessionId && (
           <div className="absolute top-4 right-4 z-10 md:hidden">
-            {/* Mobile toggle handled by DocumentList overlay usually, 
-                     but we need a trigger. Adding a simple one here. */}
             <button
               onClick={() => setIsDocListOpen(true)}
               className="p-2 bg-slate-800/80 backdrop-blur rounded-lg text-slate-300 shadow-lg border border-slate-700"
@@ -382,16 +413,16 @@ export default function Home() {
                 <h3 className="font-semibold text-lg">Document Preview</h3>
                 <button
                   onClick={() => setPreviewDocUrl(null)}
-                  className="p-1 hover:bg-slate-800 rounded-full transition-colors"
+                  className="px-2 hover:bg-slate-800 rounded-full transition-colors"
                 >
-                  <FileText size={20} className="rotate-45" /> {/* Use X icon if imported, but FileText is imported. Actually X is needed. */}
-                  {/* Wait, X is not imported in this file. Let's fix imports first or assume Layout has it or just add logic. */}
-                  <span className="text-2xl font-bold leading-none">&times;</span>
+                  <span className="text-2xl font-bold leading-none">
+                    &times;
+                  </span>
                 </button>
               </div>
               <div className="flex-1 bg-slate-800 relative">
                 <iframe
-                  src={previewDocUrl}
+                  src={`${previewDocUrl}#toolbar=0`}
                   className="w-full h-full border-0"
                   title="Document Preview"
                 />
