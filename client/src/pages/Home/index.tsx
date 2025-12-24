@@ -10,7 +10,6 @@ import {
 } from "../../components/DocumentList";
 import { FileText } from "lucide-react";
 
-import { v4 as uuidv4 } from "uuid";
 
 const API_BASE_URL = import.meta.env.VITE_API;
 
@@ -50,6 +49,7 @@ export default function Home() {
       if (res.ok) {
         const data = await res.json();
         setSessions(data);
+        console.log(data);
       }
     } catch (error) {
       console.error("Failed to fetch sessions", error);
@@ -90,7 +90,7 @@ export default function Home() {
         method: "DELETE",
       });
       if (res.ok) {
-        setSessions((prev) => prev.filter((s) => s.id !== sessionId));
+        setSessions((prev) => prev.filter((s) => s._id !== sessionId));
         if (urlSessionId === sessionId) {
           navigate("/");
         }
@@ -109,7 +109,7 @@ export default function Home() {
       });
       if (res.ok) {
         setSessions((prev) =>
-          prev.map((s) => (s.id === sessionId ? { ...s, title: newTitle } : s))
+          prev.map((s) => (s._id === sessionId ? { ...s, title: newTitle } : s))
         );
       }
     } catch (error) {
@@ -240,13 +240,9 @@ export default function Home() {
   };
 
   const handleFileUpload = async (files: FileList) => {
-    // 1. Determine the ID: Use existing URL ID or generate a new one locally
-    let targetSessionId = urlSessionId;
-    const isNewSession = !targetSessionId;
-
-    if (isNewSession) {
-      targetSessionId = uuidv4(); // Generate ID client-side
-    }
+    // 1. Determine the ID: Use existing URL ID or "new" for a new session
+    const targetSessionId = urlSessionId || "new";
+    const isNewSession = !urlSessionId;
 
     const fileArray = Array.from(files);
 
@@ -275,6 +271,9 @@ export default function Home() {
         // Log the result for debugging
         console.log("Upload result:", result);
 
+        // Get the actual session ID assigned by the server
+        const actualSessionId = result.session_id;
+
         // Show summary with better messaging
         if (result.skipped_count > 0 || result.failed_count > 0) {
           let message = "";
@@ -300,16 +299,16 @@ export default function Home() {
         const totalProcessed = result.uploaded_count + result.skipped_count;
         if (totalProcessed > 0) {
           if (isNewSession) {
-            // Fetch the newly created session data
+            // Fetch the newly created session data using the actual ID from server
             const sessionRes = await fetch(
-              `${API_BASE_URL}/chats/${targetSessionId}`
+              `${API_BASE_URL}/chats/${actualSessionId}`
             );
             if (sessionRes.ok) {
               const sessionData = await sessionRes.json();
               // Add to sidebar
               setSessions((prev) => [sessionData, ...prev]);
               // Navigate to the new session
-              navigate(`/chat/${targetSessionId}`, { replace: true });
+              navigate(`/chat/${actualSessionId}`, { replace: true });
 
               // Wait for navigation, then set state
               await new Promise((resolve) => setTimeout(resolve, 100));
@@ -319,7 +318,7 @@ export default function Home() {
             }
           } else {
             // Refresh the current session data
-            await fetchSessionData(targetSessionId);
+            await fetchSessionData(actualSessionId);
             await fetchSessions(); // Update sidebar timestamp
             setIsDocListOpen(true); // Auto-open doc list
           }

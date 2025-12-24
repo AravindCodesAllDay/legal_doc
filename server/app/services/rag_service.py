@@ -1,7 +1,7 @@
 import os
 import shutil
 from typing import List, Dict, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from langchain_chroma import Chroma
 from langchain_ollama import OllamaEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -125,7 +125,7 @@ class RAGService:
             raise ValueError(f"Failed to create chunks from {filename}")
 
         # Create documents with enhanced metadata
-        ingestion_time = datetime.utcnow().isoformat()
+        ingestion_time = datetime.now(timezone.utc).isoformat()
         documents = [
             Document(
                 page_content=chunk,

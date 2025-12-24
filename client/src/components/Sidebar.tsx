@@ -5,7 +5,7 @@ import { format } from "date-fns";
 import { useState, useRef, useEffect } from "react";
 
 export interface ChatSession {
-    id: string; // Using string to match backend uuid
+    _id: string;
     title: string;
     updated_at: string;
 }
@@ -43,7 +43,7 @@ export const Sidebar = ({
 
     const startEditing = (session: ChatSession, e: React.MouseEvent) => {
         e.stopPropagation();
-        setEditingSessionId(session.id);
+        setEditingSessionId(session._id);
         setEditTitle(session.title);
     };
 
@@ -111,21 +111,21 @@ export const Sidebar = ({
                 <div className="flex-1 overflow-y-auto px-2 py-2 space-y-1 custom-scrollbar">
                     {sessions.map((session) => (
                         <div
-                            key={session.id}
+                            key={session._id}
                             className="group relative flex items-center"
                         >
                             <div
-                                onClick={() => onSelectSession(session.id)}
+                                onClick={() => onSelectSession(session._id)}
                                 className={cn(
                                     "w-full flex items-center gap-3 px-3 py-3 rounded-lg text-left transition-colors cursor-pointer",
-                                    currentSessionId === session.id
+                                    currentSessionId === session._id
                                         ? "bg-slate-800 text-white"
                                         : "text-slate-400 hover:bg-slate-800/50 hover:text-slate-200"
                                 )}
                             >
                                 <MessageSquare size={18} className="shrink-0" />
 
-                                {editingSessionId === session.id ? (
+                                {editingSessionId === session._id ? (
                                     <input
                                         ref={editInputRef}
                                         value={editTitle}
@@ -146,7 +146,7 @@ export const Sidebar = ({
                             </div>
 
                             {/* Actions Group (Edit + Delete) */}
-                            {editingSessionId !== session.id && (
+                            {editingSessionId !== session._id && (
                                 <div className="absolute right-2 flex items-center opacity-0 group-hover:opacity-100 transition-opacity bg-slate-800/80 rounded-md backdrop-blur-sm">
                                     <button
                                         onClick={(e) => startEditing(session, e)}
@@ -158,7 +158,7 @@ export const Sidebar = ({
                                     <button
                                         onClick={(e) => {
                                             e.stopPropagation();
-                                            onDeleteSession(session.id);
+                                            onDeleteSession(session._id);
                                         }}
                                         className="p-1.5 text-slate-400 hover:text-red-400 transition-colors"
                                         title="Delete Chat"
