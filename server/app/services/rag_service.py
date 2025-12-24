@@ -1,6 +1,7 @@
 import os
 import shutil
-from typing import List, Dict, Optional
+import gc
+import time
 from datetime import datetime, timezone
 from langchain_chroma import Chroma
 from langchain_ollama import OllamaEmbeddings
@@ -84,7 +85,7 @@ class RAGService:
         temp_file_path: str,
         filename: str,
         session_id: str
-    ) -> Dict:
+    ) -> dict:
         """
         Ingest a file into the RAG system with enhanced metadata and stats
         Returns statistics about the ingestion
@@ -94,12 +95,7 @@ class RAGService:
 
         target_file_path = os.path.join(doc_path, filename)
 
-        # Check for duplicate
-        if os.path.exists(target_file_path):
-            raise FileExistsError(
-                f"File {filename} already exists in this session.")
-
-        # Copy file to permanent storage
+        # Copy file to permanent storage (overwrite if exists)
         shutil.copy(temp_file_path, target_file_path)
 
         # Extract text
@@ -165,10 +161,10 @@ class RAGService:
         self,
         query: str,
         session_id: str,
-        filenames: List[str] = None,
+        filenames: list[str] | None = None,
         k: int = 5,
         use_mmr: bool = True
-    ) -> List[Document]:
+    ) -> list[Document]:
         """
         Query documents in a session with enhanced retrieval
 
@@ -180,7 +176,7 @@ class RAGService:
             use_mmr: Whether to use Maximal Marginal Relevance for diversity
         """
         if not filenames:
-            # Get all documents in session
+            # Get all documents in session (physical files)
             _, doc_path, _ = self._get_session_paths(session_id)
             if not os.path.exists(doc_path):
                 return []
@@ -223,9 +219,9 @@ class RAGService:
         self,
         query: str,
         session_id: str,
-        filenames: List[str] = None,
+        filenames: list[str] | None = None,
         k: int = 5
-    ) -> List[tuple[Document, float]]:
+    ) -> list[tuple[Document, float]]:
         """Query with similarity scores for better ranking"""
         if not filenames:
             _, doc_path, _ = self._get_session_paths(session_id)
@@ -269,21 +265,16 @@ class RAGService:
             if os.path.exists(chroma_path):
                 vectorstore = self._get_vectorstore(session_id, filename)
                 vectorstore.delete_collection()
+                # Explicitly try to clean up chroma client if possible
+                # Chromadb sometimes locks files on Windows
+                gc.collect() 
                 print(f"Deleted collection for {filename}")
         except Exception as e:
             print(f"Error deleting vectorstore collection for {filename}: {e}")
             success = False
 
-        # Delete physical file
-        try:
-            _, doc_path, _ = self._get_session_paths(session_id)
-            file_path = os.path.join(doc_path, filename)
-            if os.path.exists(file_path):
-                os.remove(file_path)
-                print(f"Deleted file {filename}")
-        except Exception as e:
-            print(f"Error deleting file {filename}: {e}")
-            success = False
+        # Keep physical file as requested
+        print(f"Preserved physical file {filename}, only ChromaDB content removed.")
 
         return success
 
@@ -298,15 +289,23 @@ class RAGService:
             print(f"Session {session_id} directory does not exist")
             return True
 
-        try:
-            shutil.rmtree(session_root)
-            print(f"Deleted all data for session {session_id}")
-            return True
-        except Exception as e:
-            print(f"Error deleting session data for {session_id}: {e}")
-            return False
+        # Force garbage collection to release file handles before deleting directory
+        gc.collect()
+        
+        # Retry mechanism for Windows file locks
+        for attempt in range(3):
+            try:
+                shutil.rmtree(session_root)
+                print(f"Deleted all data for session {session_id}")
+                return True
+            except Exception as e:
+                print(f"Attempt {attempt + 1}: Error deleting session data for {session_id}: {e}")
+                time.sleep(0.5)
+                gc.collect()
+        
+        return False
 
-    async def get_document_stats(self, session_id: str, filename: str) -> Optional[Dict]:
+    async def get_document_stats(self, session_id: str, filename: str) -> dict | None:
         """Get statistics about a specific document"""
         try:
             vectorstore = self._get_vectorstore(session_id, filename)
@@ -326,7 +325,7 @@ class RAGService:
             print(f"Error getting stats for {filename}: {e}")
             return None
 
-    async def list_session_documents(self, session_id: str) -> List[str]:
+    async def list_session_documents(self, session_id: str) -> list[str]:
         """List all documents in a session"""
         _, doc_path, _ = self._get_session_paths(session_id)
 

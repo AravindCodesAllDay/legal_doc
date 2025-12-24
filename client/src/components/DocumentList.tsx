@@ -17,7 +17,7 @@ interface DocumentListProps {
 }
 
 export const DocumentList = ({ sessionId, documents, onDeleteDocument, isOpen, onClose, onPreview }: DocumentListProps) => {
-    const API_BASE_URL = "http://localhost:8000"; // Should come from config
+    const API_BASE_URL = import.meta.env.VITE_API;
 
     return (
         <AnimatePresence>

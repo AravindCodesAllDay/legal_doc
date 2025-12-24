@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from typing import List, Optional
+
 
 import os
 import shutil
@@ -11,17 +11,26 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 from motor.motor_asyncio import AsyncIOMotorDatabase
-
 from app.db.mongo import get_db
 from app.models.chat import ChatSession, ChatMessage, DocumentMetadata
 from app.services.rag_service import rag_service
 from app.services.ollama_service import ollama_service
+from typing import Optional, List
+
+
+def get_query(session_id: str) -> dict:
+    """Helper to create MongoDB query for session_id (String or ObjectId)"""
+    try:
+        return {"_id": ObjectId(session_id), "is_deleted": False}
+    except Exception:
+        return {"_id": session_id, "is_deleted": False}
+
 
 router = APIRouter(prefix="/chats", tags=["Chat"])
 
 
 class CreateChatRequest(BaseModel):
-    title: Optional[str] = None
+    title: str | None = None
 
 
 class RenameChatRequest(BaseModel):
@@ -30,11 +39,11 @@ class RenameChatRequest(BaseModel):
 
 class MessageRequest(BaseModel):
     message: str
-    use_mmr: Optional[bool] = True  # Enable MMR by default
-    top_k: Optional[int] = 5  # Number of context chunks
+    use_mmr: bool | None = True  # Enable MMR by default
+    top_k: int | None = 5  # Number of context chunks
 
 
-@router.post("/", response_model=ChatSession)
+@router.post("/", response_model=ChatSession, response_model_by_alias=True)
 async def create_chat_session(
     request: CreateChatRequest,
     db: AsyncIOMotorDatabase = Depends(get_db)
@@ -49,32 +58,39 @@ async def create_chat_session(
     return session
 
 
-@router.get("/", response_model=List[ChatSession])
+@router.get("/", response_model=list[ChatSession], response_model_by_alias=True)
 async def list_chat_sessions(
     skip: int = 0,
     limit: int = 20,
     db: AsyncIOMotorDatabase = Depends(get_db)
 ):
-    """List all chat sessions"""
-    cursor = db["sessions"].find().sort(
+    """List all chat sessions (excluding deleted ones)"""
+    cursor = db["sessions"].find({"is_deleted": False}).sort(
         "updated_at", -1).skip(skip).limit(limit)
     sessions = await cursor.to_list(length=limit)
+    
+    # Filter out deleted documents from each session
+    for session in sessions:
+        if "documents" in session:
+            session["documents"] = [d for d in session["documents"] if not d.get("is_deleted", False)]
+            
     return sessions
 
 
-@router.get("/{session_id}", response_model=ChatSession)
+@router.get("/{session_id}", response_model=ChatSession, response_model_by_alias=True)
 async def get_chat_session(
     session_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db)
 ):
     """Get a specific chat session"""
-    try:
-        query = {"_id": ObjectId(session_id)}
-    except Exception:
-        query = {"_id": session_id}
-    session = await db["sessions"].find_one(query)
+    session = await db["sessions"].find_one(get_query(session_id))
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+    
+    # Filter out deleted documents
+    if "documents" in session:
+        session["documents"] = [d for d in session["documents"] if not d.get("is_deleted", False)]
+        
     return session
 
 
@@ -83,20 +99,23 @@ async def delete_chat_session(
     session_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db)
 ):
-    """Delete a chat session and all associated data"""
-    try:
-        query = {"_id": ObjectId(session_id)}
-    except Exception:
-        query = {"_id": session_id}
-    result = await db["sessions"].delete_one(query)
-    if result.deleted_count == 0:
+    """Soft delete a chat session and clean up RAG data"""
+    query = get_query(session_id)
+    result = await db["sessions"].update_one(
+        query,
+        {
+            "$set": {"is_deleted": True},
+            "$currentDate": {"updated_at": True}
+        }
+    )
+    if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    # Clean up RAG data (documents and vectorstores)
+    # Clean up RAG data (physical deletion from ChromaDB/storage)
     deletion_success = await rag_service.delete_session_data(session_id)
 
     return {
-        "message": "Session deleted",
+        "message": "Session deleted logically and RAG data cleaned up",
         "rag_cleanup_success": deletion_success
     }
 
@@ -117,11 +136,9 @@ async def upload_documents(
     # Get or create session
     try:
         query_id = ObjectId(session_id)
-        session = await db["sessions"].find_one({"_id": query_id})
+        session = await db["sessions"].find_one({"_id": query_id, "is_deleted": False})
     except Exception:
-        # If session_id is not a valid ObjectId (e.g. from older system or client-side generation)
-        # we check if it exists as a string _id first
-        session = await db["sessions"].find_one({"_id": session_id})
+        session = await db["sessions"].find_one({"_id": session_id, "is_deleted": False})
         if session:
             query_id = session_id
         else:
@@ -133,8 +150,11 @@ async def upload_documents(
             session = doc
 
     # Get existing filenames to check for duplicates
-    existing_filenames = {doc.get("filename")
-                          for doc in session.get("documents", [])}
+    existing_filenames = {
+        doc.get("filename")
+        for doc in session.get("documents", [])
+        if not doc.get("is_deleted", False)
+    }
 
     uploaded_files = []
     total_chunks = 0
@@ -219,7 +239,7 @@ async def upload_documents(
             {"_id": query_id},
             {
                 "$push": {"documents": {"$each": uploaded_files}},
-                "$set": {"updated_at": datetime.now(timezone.utc)}
+                "$currentDate": {"updated_at": True}
             }
         )
 
@@ -253,17 +273,16 @@ async def send_message(
     db: AsyncIOMotorDatabase = Depends(get_db)
 ):
     """Send a message and get AI response with RAG context"""
-    try:
-        query = {"_id": ObjectId(session_id)}
-    except Exception:
-        query = {"_id": session_id}
-    session_data = await db["sessions"].find_one(query)
+    session_data = await db["sessions"].find_one(get_query(session_id))
     if not session_data:
         raise HTTPException(status_code=404, detail="Session not found")
 
     # Get list of available documents
-    available_docs = [d.get("filename")
-                      for d in session_data.get("documents", [])]
+    available_docs = [
+        d.get("filename")
+        for d in session_data.get("documents", [])
+        if not d.get("is_deleted", False)
+    ]
 
     # Retrieve relevant context using enhanced query
     context_texts = []
@@ -302,10 +321,10 @@ async def send_message(
     # Append user message to session
     user_msg = ChatMessage(role="user", content=request.message)
     await db["sessions"].update_one(
-        query,
+        get_query(session_id),
         {
             "$push": {"messages": user_msg.model_dump()},
-            "$set": {"updated_at": datetime.now(timezone.utc)}
+            "$currentDate": {"updated_at": True}
         }
     )
 
@@ -325,10 +344,10 @@ async def send_message(
             assistant_msg = ChatMessage(
                 role="assistant", content=full_response)
             await db["sessions"].update_one(
-                query,
+                get_query(session_id),
                 {
                     "$push": {"messages": assistant_msg.model_dump()},
-                    "$set": {"updated_at": datetime.now(timezone.utc)}
+                    "$currentDate": {"updated_at": True}
                 }
             )
             yield "data: [DONE]\n\n"
@@ -348,32 +367,34 @@ async def delete_document(
     filename: str,
     db: AsyncIOMotorDatabase = Depends(get_db)
 ):
-    """Delete a specific document from a session"""
-    try:
-        query = {"_id": ObjectId(session_id)}
-    except Exception:
-        query = {"_id": session_id}
+    """Soft delete a specific document from a session and remove from ChromaDB"""
+    query = get_query(session_id)
     session = await db["sessions"].find_one(query)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    # Delete from RAG (vectorstore + file)
-    deletion_success = await rag_service.delete_document(session_id, filename)
-
-    if not deletion_success:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to delete document {filename}"
-        )
-
-    # Remove from database metadata
-    await db["sessions"].update_one(
-        query,
+    # Mark specifically the non-deleted document as deleted in MongoDB
+    result = await db["sessions"].update_one(
         {
-            "$pull": {"documents": {"filename": filename}},
-            "$set": {"updated_at": datetime.now(timezone.utc)}
+            "_id": session["_id"],
+            "documents": {
+                "$elemMatch": {
+                    "filename": filename,
+                    "is_deleted": False
+                }
+            }
+        },
+        {
+            "$set": {"documents.$.is_deleted": True},
+            "$currentDate": {"updated_at": True}
         }
     )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    # Delete from RAG (remove from ChromaDB collection + physical file)
+    deletion_success = await rag_service.delete_document(session_id, filename)
 
     # Add system message
     system_note = ChatMessage(
@@ -386,7 +407,7 @@ async def delete_document(
     )
 
     return {
-        "message": f"Document {filename} deleted successfully",
+        "message": f"Document {filename} deleted logically and RAG data cleaned up",
         "deletion_success": deletion_success
     }
 
@@ -398,13 +419,12 @@ async def rename_chat_session(
     db: AsyncIOMotorDatabase = Depends(get_db)
 ):
     """Rename a chat session"""
-    try:
-        query = {"_id": ObjectId(session_id)}
-    except Exception:
-        query = {"_id": session_id}
     result = await db["sessions"].update_one(
-        query,
-        {"$set": {"title": request.title, "updated_at": datetime.now(timezone.utc)}}
+        get_query(session_id),
+        {
+            "$set": {"title": request.title},
+            "$currentDate": {"updated_at": True}
+        }
     )
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -420,23 +440,19 @@ async def get_document_file(
 ):
     """Download/view a document file"""
     # Verify session exists
-    try:
-        query = {"_id": ObjectId(session_id)}
-    except Exception:
-        query = {"_id": session_id}
-    session = await db["sessions"].find_one(query)
+    session = await db["sessions"].find_one(get_query(session_id))
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    # Verify document exists in session
+    # Verify document exists in session and is not deleted
     doc_exists = any(
-        d.get("filename") == filename
+        d.get("filename") == filename and not d.get("is_deleted", False)
         for d in session.get("documents", [])
     )
     if not doc_exists:
         raise HTTPException(
             status_code=404,
-            detail="Document not found in this session"
+            detail="Document not found or deleted"
         )
 
     storage_path = os.path.join("storage", session_id, "documents", filename)
@@ -478,11 +494,7 @@ async def get_document_stats(
     db: AsyncIOMotorDatabase = Depends(get_db)
 ):
     """Get statistics about a document's chunks and embeddings"""
-    try:
-        query = {"_id": ObjectId(session_id)}
-    except Exception:
-        query = {"_id": session_id}
-    session = await db["sessions"].find_one(query)
+    session = await db["sessions"].find_one(get_query(session_id))
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
@@ -502,16 +514,12 @@ async def list_session_documents(
     session_id: str,
     db: AsyncIOMotorDatabase = Depends(get_db)
 ):
-    """List all documents in a session with their metadata"""
-    try:
-        query = {"_id": ObjectId(session_id)}
-    except Exception:
-        query = {"_id": session_id}
-    session = await db["sessions"].find_one(query)
+    """List all documents in a session with their metadata (excluding deleted)"""
+    session = await db["sessions"].find_one(get_query(session_id))
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    documents = session.get("documents", [])
+    documents = [d for d in session.get("documents", []) if not d.get("is_deleted", False)]
 
     return {
         "session_id": session_id,

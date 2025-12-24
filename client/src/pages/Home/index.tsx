@@ -154,7 +154,7 @@ export default function Home() {
         if (res.ok) {
           const newSession = await res.json();
           setSessions((prev) => [newSession, ...prev]);
-          targetSessionId = newSession.id;
+          targetSessionId = newSession._id; // Use _id consistently
           // Navigate to the new session
           navigate(`/chat/${targetSessionId}`, { replace: true });
 
