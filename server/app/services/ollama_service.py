@@ -25,20 +25,21 @@ class OllamaService:
             context_docs: Optional list of context strings from RAG
         """
 
-        # Build enhanced system prompt
-        system_prompt = """You are a helpful AI assistant with access to documents.
+        # Build enhanced legal system prompt
+        system_prompt = """You are an elite Legal Expert Assistant specializing in document analysis, legal reasoning, and law.
 
-When answering questions:
-1. If context from documents is provided, base your answer primarily on that context
-2. Cite the source document when using information from it (e.g., "According to [filename]...")
-3. If the context doesn't contain enough information, say so clearly
-4. Be concise but thorough
-5. If no documents are available, answer from your general knowledge"""
+CORE DIRECTIVES:
+1. LEGAL PRECISION: Analyze all input with a legal lens. Look for obligations, rights, definitions, and jurisdictional nuances.
+2. RAG CONTEXT FIRST: If document context is provided, it is your primary source of truth. Cite specific filenames and quote relevant sections when possible.
+3. KNOWLEDGE INTEGRATION: If the documents are silent on a point, use your internal knowledge of law to provide general legal principles, but clearly distinguish them as "general legal perspective" vs "document-specific findings".
+4. STRUCTURED REASONING: Break down complex legal queries into issues, relevant rules/clauses, analysis, and conclusions (IRAC-style).
+5. CITATION: Always cite sources in the format: [Source: filename, Page/Chunk X].
+6. CAUTION: Remind the user that your output is for informational purposes and not formal legal advice when making significant legal interpretations."""
 
         # Add RAG context if available
         if context_docs:
             context_str = "\n\n".join(context_docs)
-            system_prompt += f"\n\n=== DOCUMENT CONTEXT ===\n{context_str}\n=== END CONTEXT ==="
+            system_prompt += f"\n\n=== AUTHORITATIVE DOCUMENT CONTEXT ===\n{context_str}\n=== END CONTEXT ==="
 
         # Convert to LangChain messages
         langchain_messages = [SystemMessage(content=system_prompt)]
@@ -64,6 +65,31 @@ When answering questions:
             error_msg = f"Error streaming from Ollama: {str(e)}"
             print(error_msg)
             yield f"\n\n[Error: {error_msg}]"
+
+    async def generate_queries(self, original_query: str, count: int = 3) -> List[str]:
+        """
+        Generate variations of a query to improve RAG retrieval accuracy.
+        """
+        prompt = f"""You are a search expert. Generate {count} different versions of the following legal query to help find relevant documents. 
+Include alternative legal terminology or broader/narrower versions of the question.
+
+Original Query: "{original_query}"
+
+Output ONLY the queries, one per line, without numbers or any other text."""
+
+        messages = [
+            SystemMessage(content="You generate search query variations."),
+            HumanMessage(content=prompt)
+        ]
+
+        try:
+            response = await self.llm.ainvoke(messages)
+            queries = [q.strip() for q in response.content.split("\n") if q.strip()]
+            # Always include the original query
+            return list(set([original_query] + queries[:count]))
+        except Exception as e:
+            print(f"Error generating queries: {e}")
+            return [original_query]
 
     async def generate_title(self, first_message: str) -> str:
         """

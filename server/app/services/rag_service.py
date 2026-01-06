@@ -18,8 +18,8 @@ class RAGService:
             base_url=settings.OLLAMA_HOST
         )
         self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
+            chunk_size=700,
+            chunk_overlap=150,
             length_function=len,
             separators=["\n\n", "\n", ". ", " ", ""]
         )
@@ -33,17 +33,14 @@ class RAGService:
         chroma_path = os.path.join(session_root, "chroma")
         return session_root, doc_path, chroma_path
 
-    def _get_collection_name(self, session_id: str, filename: str) -> str:
-        """Generate a unique collection name for each document"""
-        # Sanitize filename for collection name (remove special chars)
-        safe_filename = filename.replace(
-            ".", "_").replace(" ", "_").replace("-", "_")
-        return f"session_{session_id}_doc_{safe_filename}"
+    def _get_collection_name(self, session_id: str) -> str:
+        """Generate a unique collection name for a session"""
+        return f"session_{session_id}_v2"
 
-    def _get_vectorstore(self, session_id: str, filename: str) -> Chroma:
-        """Get vectorstore for a specific document in a session"""
+    def _get_vectorstore(self, session_id: str) -> Chroma:
+        """Get vectorstore for a session"""
         _, _, chroma_path = self._get_session_paths(session_id)
-        collection_name = self._get_collection_name(session_id, filename)
+        collection_name = self._get_collection_name(session_id)
 
         return Chroma(
             collection_name=collection_name,
@@ -136,9 +133,9 @@ class RAGService:
             ) for idx, chunk in enumerate(chunks)
         ]
 
-        # Store in vectorstore (separate collection per document)
+        # Store in vectorstore (unified session collection)
         try:
-            vectorstore = self._get_vectorstore(session_id, filename)
+            vectorstore = self._get_vectorstore(session_id)
             vectorstore.add_documents(documents)
         except Exception as e:
             # Cleanup on failure
@@ -163,57 +160,66 @@ class RAGService:
         session_id: str,
         filenames: list[str] | None = None,
         k: int = 5,
-        use_mmr: bool = True
+        use_mmr: bool = True,
+        expand_query: bool = True
     ) -> list[Document]:
         """
-        Query documents in a session with enhanced retrieval
-
-        Args:
-            query: The search query
-            session_id: Session identifier
-            filenames: Optional list of specific filenames to search. If None, searches all.
-            k: Number of results to return
-            use_mmr: Whether to use Maximal Marginal Relevance for diversity
+        Query documents in a session with optional Multi-Query expansion
         """
-        if not filenames:
-            # Get all documents in session (physical files)
-            _, doc_path, _ = self._get_session_paths(session_id)
-            if not os.path.exists(doc_path):
-                return []
-            filenames = [f for f in os.listdir(
-                doc_path) if os.path.isfile(os.path.join(doc_path, f))]
+        from app.services.ollama_service import ollama_service
 
-        if not filenames:
-            return []
-
-        all_results = []
-        # Distribute k across documents
-        results_per_doc = max(2, k // len(filenames))
-
-        for filename in filenames:
+        # Generate queries if expansion is enabled
+        queries = [query]
+        if expand_query:
             try:
-                vectorstore = self._get_vectorstore(session_id, filename)
+                queries = await ollama_service.generate_queries(query, count=2)
+                print(f"Expanded queries: {queries}")
+            except Exception as e:
+                print(f"Query expansion failed: {e}")
 
+        try:
+            vectorstore = self._get_vectorstore(session_id)
+            
+            # Use metadata filter if specific files are requested
+            filter_dict = None
+            if filenames:
+                filter_dict = {"source": {"$in": filenames}}
+
+            all_results = []
+            
+            # Run search for each query variation
+            for q in queries:
                 if use_mmr:
-                    # Use MMR for diversity
                     results = vectorstore.max_marginal_relevance_search(
-                        query,
-                        k=results_per_doc,
-                        fetch_k=results_per_doc * 3
+                        q,
+                        k=k,
+                        fetch_k=k * 3,
+                        filter=filter_dict
                     )
                 else:
-                    # Simple similarity search
                     results = vectorstore.similarity_search(
-                        query, k=results_per_doc)
-
+                        q, 
+                        k=k,
+                        filter=filter_dict
+                    )
                 all_results.extend(results)
 
-            except Exception as e:
-                print(f"Warning: Error querying document {filename}: {e}")
-                continue
+            # Deduplicate results based on content and metadata
+            seen_content = set()
+            unique_results = []
+            for doc in all_results:
+                content_hash = hash(doc.page_content + doc.metadata.get("source", ""))
+                if content_hash not in seen_content:
+                    seen_content.add(content_hash)
+                    unique_results.append(doc)
 
-        # Return top k results
-        return all_results[:k]
+            # Re-sort by score/relevance if possible, or just return top k
+            # Since we have multiple queries, we simple return the first k unique matches
+            return unique_results[:k]
+
+        except Exception as e:
+            print(f"Error querying session {session_id}: {e}")
+            return []
 
     async def query_with_scores(
         self,
@@ -222,61 +228,40 @@ class RAGService:
         filenames: list[str] | None = None,
         k: int = 5
     ) -> list[tuple[Document, float]]:
-        """Query with similarity scores for better ranking"""
-        if not filenames:
-            _, doc_path, _ = self._get_session_paths(session_id)
-            if not os.path.exists(doc_path):
-                return []
-            filenames = [f for f in os.listdir(
-                doc_path) if os.path.isfile(os.path.join(doc_path, f))]
+        """Query with similarity scores using unified collection"""
+        try:
+            vectorstore = self._get_vectorstore(session_id)
+            
+            filter_dict = None
+            if filenames:
+                filter_dict = {"source": {"$in": filenames}}
 
-        if not filenames:
+            return vectorstore.similarity_search_with_score(
+                query,
+                k=k,
+                filter=filter_dict
+            )
+        except Exception as e:
+            print(f"Error querying sessions {session_id} with scores: {e}")
             return []
-
-        all_results = []
-        results_per_doc = max(2, k // len(filenames))
-
-        for filename in filenames:
-            try:
-                vectorstore = self._get_vectorstore(session_id, filename)
-                results = vectorstore.similarity_search_with_score(
-                    query,
-                    k=results_per_doc
-                )
-                all_results.extend(results)
-            except Exception as e:
-                print(f"Warning: Error querying document {filename}: {e}")
-                continue
-
-        # Sort by score (lower is better for distance metrics)
-        all_results.sort(key=lambda x: x[1])
-        return all_results[:k]
 
     async def delete_document(self, session_id: str, filename: str) -> bool:
         """
-        Delete a specific document and its vectorstore collection
-        Returns True if successful, False otherwise
+        Delete a specific document's chunks from the shared vectorstore
         """
-        success = True
-
-        # Delete vectorstore collection
         try:
-            _, _, chroma_path = self._get_session_paths(session_id)
-            if os.path.exists(chroma_path):
-                vectorstore = self._get_vectorstore(session_id, filename)
-                vectorstore.delete_collection()
-                # Explicitly try to clean up chroma client if possible
-                # Chromadb sometimes locks files on Windows
-                gc.collect() 
-                print(f"Deleted collection for {filename}")
+            vectorstore = self._get_vectorstore(session_id)
+            # LangChain Chroma doesn't have a direct 'delete by filter' in all versions
+            # But we can access the underlying collection
+            collection = vectorstore._collection
+            collection.delete(where={"source": filename})
+            
+            gc.collect() 
+            print(f"Deleted chunks for {filename} from session {session_id}")
+            return True
         except Exception as e:
-            print(f"Error deleting vectorstore collection for {filename}: {e}")
-            success = False
-
-        # Keep physical file as requested
-        print(f"Preserved physical file {filename}, only ChromaDB content removed.")
-
-        return success
+            print(f"Error deleting chunks for {filename}: {e}")
+            return False
 
     async def delete_session_data(self, session_id: str) -> bool:
         """
@@ -306,20 +291,19 @@ class RAGService:
         return False
 
     async def get_document_stats(self, session_id: str, filename: str) -> dict | None:
-        """Get statistics about a specific document"""
+        """Get statistics about a specific document's chunks"""
         try:
-            vectorstore = self._get_vectorstore(session_id, filename)
+            vectorstore = self._get_vectorstore(session_id)
             collection = vectorstore._collection
-            count = collection.count()
-
-            # Get a sample document for metadata
-            results = vectorstore.similarity_search("", k=1)
-            metadata = results[0].metadata if results else {}
+            
+            # Count chunks for this specific file
+            all_metadatas = collection.get(where={"source": filename}, include=['metadatas'])
+            count = len(all_metadatas['metadatas']) if all_metadatas and 'metadatas' in all_metadatas else 0
 
             return {
                 "filename": filename,
                 "chunk_count": count,
-                "metadata": metadata
+                "session_id": session_id
             }
         except Exception as e:
             print(f"Error getting stats for {filename}: {e}")
